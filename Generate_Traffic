@@ -1,0 +1,862 @@
+import bpy
+import random
+from mathutils import Vector
+from math import radians
+import math
+
+import os
+import numpy as np
+# import pandas as pd
+import time
+import csv
+import bmesh
+import range_scanner
+from range_scanner.ui import user_interface
+
+import time
+import tracemalloc
+
+
+def set_category_id(obj, category_id,part_id):
+    obj["categoryID"] = category_id
+    obj["partID"] = part_id
+    for child in obj.children:
+        set_category_id(child, category_id,part_id)
+
+
+def simplify_materials(obj):
+    # Create a simple material
+    simple_material = bpy.data.materials.new(name="SimpleMaterial")
+    simple_material.use_nodes = False
+    simple_material.diffuse_color = (0.8, 0.8, 0.8, 1)  # Light gray color
+
+    # Assign the simple material to all parts of the object
+    if obj.type == 'MESH':
+        obj.data.materials.clear()
+        obj.data.materials.append(simple_material)
+    elif obj.type == 'ARMATURE':
+        for child in obj.children:
+            if child.type == 'MESH':
+                child.data.materials.clear()
+                child.data.materials.append(simple_material)
+
+#:::::::::::::Pedestrians generation::::::::::::::::::::::::::
+def set_origin_to_bottom(obj):
+    """
+    This function sets the origin of an object to the bottom of its bounding box,
+    ensuring that the object sits 'flat' on the ground plane at z=0.
+    """
+    # Switch to object mode and deselect all objects
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    
+    # Calculate the minimum Z value of the bounding box in world coordinates
+    min_z = min([obj.matrix_world @ Vector(corner).z for corner in obj.bound_box])
+
+    # Move the object so that the lowest point is at z=0
+    obj.location.z -= min_z
+    
+    # Apply the transformation and set the origin to the geometry
+    bpy.ops.object.transform_apply(location=True)
+    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+
+def ped_load_region(area):
+    # Get the plane object
+    plane = bpy.data.objects.get(area)
+    
+    if plane:
+        # Calculate the world coordinates of the bounding box corners
+        world_corners = [plane.matrix_world @ Vector(corner) for corner in plane.bound_box]
+        min_x = min(corner.x for corner in world_corners)
+        max_x = max(corner.x for corner in world_corners)
+        min_y = min(corner.y for corner in world_corners)
+        max_y = max(corner.y for corner in world_corners)
+        z = plane.location.z # Assuming z is the ground level and not changed
+        
+        print("X Range:", min_x, "-", max_x)
+        print("Y Range:", min_y, "-", max_y)
+
+        return min_x, max_x, min_y, max_y, z
+    else:
+        print(f"Plane '{plane}' not found.")
+    return None, None, None, None, None # Return None if plane not found
+
+
+def move_pedestrian(pedestrian):
+    action = pedestrian.animation_data.action
+    if action:
+        action.use_fake_user = True  # Ensure the action data is kept even if it has no users
+     
+        # First, set all fcurves to CYCLIC extrapolation
+        for fcurve in action.fcurves:
+            cyclic_modifier = fcurve.modifiers.new(type='CYCLES')
+            cyclic_modifier.mode_before = 'REPEAT'
+            cyclic_modifier.mode_after = 'REPEAT'
+
+        # Now find the specific fcurve for the Z location of "Hips"
+        for fcurve in action.fcurves:
+            # Check if this fcurve is for the Z location of the hips
+            if "Hips" in fcurve.data_path and "location" in fcurve.data_path and fcurve.array_index == 2:
+                print("found z location fcurve path:", fcurve.data_path, "the index is:", fcurve.array_index)
+               
+                for modifier in fcurve.modifiers:
+                    modifier.mute = True  # Disable the modifier without removing it
+
+                # Set extrapolation to LINEAR specifically for this fcurve
+                fcurve.extrapolation = 'LINEAR'
+
+        # Set interpolation type
+        for kf in fcurve.keyframe_points:
+            kf.interpolation = 'BEZIER'  # Common choice for smooth transitions
+
+
+def import_pedestrian(pedestrian, min_x, max_x, min_y, max_y, z_axis, ped_collection, walk_area, road, ped_scale_ranges):
+    # random_start_delay = random.uniform(0, 5) # Introduce delay before movement starts we can adjust this parameter
+    x = random.uniform(min_x, max_x)
+    y = random.uniform(min_y, max_y)
+    z = z_axis
+    print("Randomly generated coordinates:", (x, y, z))
+    
+    # Set the file path to your object file
+    fbx_file_path = bpy.path.abspath("//") + "Pedestrians/" + pedestrian + ".fbx"
+    
+    # Set the active collection where you want to import the object
+    collection = bpy.data.collections.get(ped_collection)
+    if collection:
+        bpy.context.view_layer.active_layer_collection = bpy.context.view_layer.layer_collection.children[ped_collection]
+    else:
+        print(f"Collection '{collection}' not found.")
+    
+    # Import the object from the file
+    bpy.ops.import_scene.fbx(filepath=fbx_file_path,     axis_forward='-Z',
+    axis_up='Y',
+    use_image_search=True,
+    use_anim=True,
+    use_custom_normals=True)
+
+    # # Verify the imported materials
+    # imported_objects = bpy.context.selected_objects
+    # for obj in imported_objects:
+    #     if obj.type == 'MESH':
+    #         print(f"Object: {obj.name}")
+    #         if not obj.material_slots:
+    #             print("No material slots found")
+    #         for slot in obj.material_slots:
+    #             material = slot.material
+    #             if material:
+    #                 print(f"  Material: {material.name}")
+    #                 print(f"    Use Nodes: {material.use_nodes}")
+    #                 if material.use_nodes:
+    #                     for node in material.node_tree.nodes:
+    #                         print(f"    Node: {node.name} - {node.type}")
+    #                         if node.type == 'BSDF_PRINCIPLED':
+    #                             print(f"      Base Color: {node.inputs['Base Color'].default_value}")
+    #                             print(f"      Roughness: {node.inputs['Roughness'].default_value}")
+    #                             print(f"      Metallic: {node.inputs['Metallic'].default_value}")
+    #             else:
+    #                 print(f"  Material Slot Empty")
+
+    # Create an empty object to serve as the parent for all imported objects
+    imported_pedestrian = bpy.context.active_object # bpy.data.objects.new(pedestrian, None) # None means no mesh (empty)
+    if imported_pedestrian:    
+        imported_pedestrian.location = (x, y, z)
+        imported_pedestrian.name = pedestrian
+        
+        scale_min, scale_max = ped_scale_ranges.get(pedestrian.split('_')[0], (1.0, 1.0))
+        scale_value = random.uniform(scale_min, scale_max)
+        imported_pedestrian.scale = (scale_value, scale_value, scale_value)
+      
+
+        # Simplify materials
+        simplify_materials(imported_pedestrian)
+
+        # Setup different behaviors based on location
+        if "cornerwalk" in walk_area:
+            # For cornerwalk, set random orientation and do not move
+            angle = random.uniform(0, 360)
+            imported_pedestrian.rotation_euler.z = angle
+            start_frame = bpy.context.scene.frame_current
+            end_frame = bpy.context.scene.frame_end #start_frame + 3000
+        else:
+            start_frame = bpy.context.scene.frame_current
+            # conditions to rotate the loaded pedestrian based on the road on z_axis
+            if road == "Road1":
+                imported_pedestrian.rotation_euler.z -= radians(180)
+            elif road == "Road2":
+                imported_pedestrian.rotation_euler.z += radians(90)
+            elif road == "Road4":
+                imported_pedestrian.rotation_euler.z -= radians(90)
+
+            if "Standing" in pedestrian:
+                end_frame = bpy.context.scene.frame_end #start_frame + 3000
+            elif "Walking" in pedestrian: 
+                # For sidewalks, pedestrians should move straight
+                imported_pedestrian.location = (x, y, z)
+                start_frame = bpy.context.scene.frame_current
+                end_frame = bpy.context.scene.frame_end #start_frame + 3000
+                move_pedestrian(imported_pedestrian)
+            
+        # # Hide the armature object
+        # if imported_pedestrian.type == 'ARMATURE':
+        #     imported_pedestrian.hide_set(True)
+        #     imported_pedestrian.hide_viewport = True
+         # Assign category and part IDs to the imported vehicle
+        if road is not None:
+            category_id = (imported_pedestrian.parent.name if imported_pedestrian.parent else imported_pedestrian.name)  + '_' + road
+        else:
+            category_id = imported_pedestrian.parent.name if imported_pedestrian.parent else imported_pedestrian.name
+        part_id = category_id
+        set_category_id(imported_pedestrian, category_id, part_id)
+    
+    return imported_pedestrian, end_frame
+
+
+
+
+def check_collision(new_position, existing_positions,vehicle_dimensions, min_distance=1.0):
+    """
+    Checks if the new location is too close to any existing locations.
+
+    Args:
+    - new_location (Vector): Proposed location for the new vehicle.
+    - existing_locations (list of Vector): List of existing vehicle locations.
+    - min_distance (float): Minimum distance required between vehicles.. we choose 1 meter minimum.
+
+    Returns:
+    - True if collision (too close), False otherwise.
+    """
+    # new_x, new_y = new_position
+        
+    # # Calculate the bounding box for the new vehicle
+    # new_bbox = (
+    #     new_x - vehicle_dimensions[0] / 2,
+    #     new_x + vehicle_dimensions[0] / 2,
+    #     new_y - vehicle_dimensions[1] / 2,
+    #     new_y + vehicle_dimensions[1] / 2
+    # )
+    
+    # # Check against existing vehicle positions
+    # for existing_position in existing_positions:
+    #     existing_x, existing_y = existing_position
+        
+    #     # Calculate the bounding box for the existing vehicle
+    #     existing_bbox = (
+    #         existing_x - vehicle_dimensions[0] / 2,
+    #         existing_x + vehicle_dimensions[0] / 2,
+    #         existing_y - vehicle_dimensions[1] / 2,
+    #         existing_y + vehicle_dimensions[1] / 2
+    #     )
+        
+    #     # Check for overlap
+    #     if (new_bbox[0] < existing_bbox[1] and
+    #         new_bbox[1] > existing_bbox[0] and
+    #         new_bbox[2] < existing_bbox[3] and
+    #         new_bbox[3] > existing_bbox[2] and 
+    #         (existing_position - new_position).length < min_distance):
+    #         return True  # Collision detected
+    
+    # Extract dimensions
+    vehicle_width, vehicle_length = vehicle_dimensions
+    
+    # Calculate bounding box for the new vehicle
+    new_x, new_y = new_position
+    new_bbox_min = Vector((new_x - vehicle_length / 2, new_y - vehicle_width / 2))
+    new_bbox_max = Vector((new_x + vehicle_length / 2, new_y + vehicle_width / 2))
+    
+    # Check against existing vehicle positions
+    for existing_position in existing_positions:
+        existing_x, existing_y = existing_position
+        
+        # Calculate bounding box for the existing vehicle
+        existing_bbox_min = Vector((existing_x - vehicle_length / 2, existing_y - vehicle_width / 2))
+        existing_bbox_max = Vector((existing_x + vehicle_length / 2, existing_y + vehicle_width / 2))
+        
+        # Check for overlap
+        if (new_bbox_min.x < existing_bbox_max.x and
+            new_bbox_max.x > existing_bbox_min.x and
+            new_bbox_min.y < existing_bbox_max.y and
+            new_bbox_max.y > existing_bbox_min.y):
+            #and (existing_position - Vector((new_x, new_y))).length < min_distance):
+            return True  # Collision detected
+        
+    return False  # No collision detected
+
+
+def obj_loading_region(plane_name):
+    # Initialize variables with default values
+    min_x = max_x = min_y = max_y = z = 0
+
+    # Get the plane object
+    plane = bpy.data.objects.get(plane_name)
+    
+    if plane:
+        bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+        # Get the location and scale of the plane
+        location = plane.location
+        # scale = plane.scale
+
+        # # Calculate the range within the plane
+        # min_x = location.x - (0.5 * scale.x)
+        # max_x = location.x + (0.5 * scale.x)
+        # min_y = location.y - (0.5 * scale.y)
+        # max_y = location.y + (0.5 * scale.y)
+        
+        z = location.z
+            # Use the bounding box to calculate the range within the plane
+        bbox_corners = [plane.matrix_world @ Vector(corner) for corner in plane.bound_box]
+        xs = [v.x for v in bbox_corners]
+        ys = [v.y for v in bbox_corners]
+
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+            
+        print("X Range:", min_x, "-", max_x)
+        print("Y Range:", min_y, "-", max_y)
+
+    return min_x, max_x, min_y, max_y, z
+
+
+def delete_objects_in_collection():
+    Vehicles = "Vehicles"
+    collection = bpy.data.collections.get(Vehicles)
+    
+    if not collection:
+        print(f"Collection '{collection_name}' not found.")
+        return
+    
+    bpy.ops.object.select_all(action='DESELECT')
+    
+    # Iterate over a copy of the list of objects to avoid modifying the collection while iterating
+    objects_to_delete = [obj for obj in collection.objects]
+    
+    for obj in objects_to_delete:
+        # Select the object
+        obj.select_set(True)
+        # Unlink the object from the collection
+        collection.objects.unlink(obj)
+        # Delete the object from the Blender data
+        bpy.data.objects.remove(obj)
+    
+    print(f"All objects in collection '{Vehicles}' have been deleted.")
+
+
+def generate_vehicle(x, y, z, vec_collection, road, vehicle, car_dimensions, drive_direction):
+    
+    file_path = bpy.path.abspath("//") + "Vehicles/" + road + "/" + vehicle + ".obj"
+
+    # Set the active collection where you want to import the object
+    collection = bpy.data.collections.get(vec_collection)
+    if collection:
+        print(collection)
+        bpy.context.view_layer.active_layer_collection = bpy.context.view_layer.layer_collection.children[vec_collection]
+        # Import the object from the file
+        bpy.ops.wm.obj_import(filepath=file_path)
+        
+    else:
+        print(f"Collection '{collection}' not found.")
+        
+    my_car = bpy.context.active_object
+    
+   
+    
+    # Proceed with setting the location and other properties of the imported object
+    if my_car:
+        my_car.name = vehicle 
+       
+        bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS') # Set origin to geometry center
+        
+        # Calculate scale factors based on real-world dimensions
+        #scale_factors = [
+            #vec_real_dimensions[road][vehicle][i] / imported_object.dimensions[i]
+            #for i in range(3)
+        #]
+        # Apply scale factors to the imported object
+        # imported_object.scale = scale_factors
+
+        if my_car.name in ['Truck']:
+            my_car.location = (x, y, z + 2)
+        elif my_car.name in ['Bus']:
+            my_car.location = (x, y, z + 1.9)
+        elif my_car.name in ['Car(sedan)']:
+            my_car.location = (x, y, z + 0.7)
+        elif my_car.name in ['Car(pickup)']:
+            my_car.location = (x, y, z + 1.25)
+        elif my_car.name in ['Car(mini car)']:
+            my_car.location = (x, y, z + 0.9)
+
+        
+        
+        distance = 250
+#        print(distance)
+        movetheVehicle(x,y,z,road,my_car,drive_direction,distance)
+        
+
+def movetheVehicle(x, y, z, road, my_car, drive_direction, distance):
+    # Adjust 'real_speed' to match the desired speed in Blender units per second
+    real_speed = 16.88 # Blender units per second
+    fps = bpy.context.scene.render.fps # Get the current scene's frames per second
+
+    # Movement parameters
+    start_frame = bpy.context.scene.frame_current
+    time_seconds = distance / real_speed # Time in seconds to cover the distance at the given speed
+    end_frame = bpy.context.scene.frame_current + round(time_seconds * fps) # Calculate end frame based on time and fps
+
+#    stop_duration_seconds = 5  # Duration to stop at the intersection
+    stop_duration_frames = 50
+
+    intersection_frame = 110
+    stop_distance = 88
+
+    if drive_direction == 'straight':
+        axis_index = {'x': 0, 'y': 1, 'z': 2}
+        if road in ['Road1', 'Road3']: # Example: Roads 1 and 3 are North-South
+            move_axis = 'y' # Adjust movement along Y-axis
+            start_pos = my_car.location.y
+            end_pos = start_pos + (distance if road == 'Road1' else -distance)
+            stop_pos = start_pos + (stop_distance if road == 'Road1' else -stop_distance)
+        
+        elif road in ['Road2', 'Road4']: # Example: Roads 2 and 4 are East-West
+            move_axis = 'x' # Adjust movement along X-axis
+            start_pos = my_car.location.x
+            end_pos = start_pos + (distance if road == 'Road2' else -distance)
+            stop_pos = start_pos + (stop_distance if road == 'Road2' else -stop_distance)
+        
+        # Insert keyframes for stopping at the intersection
+        setattr(my_car.location, move_axis, start_pos)
+        my_car.keyframe_insert(data_path="location", index=axis_index[move_axis], frame=start_frame)
+        
+        setattr(my_car.location, move_axis, stop_pos)
+        my_car.keyframe_insert(data_path="location", index=axis_index[move_axis], frame=intersection_frame)
+        
+        setattr(my_car.location, move_axis, stop_pos)
+        my_car.keyframe_insert(data_path="location", index=axis_index[move_axis], frame=intersection_frame + stop_duration_frames)
+        
+        setattr(my_car.location, move_axis, end_pos)
+        my_car.keyframe_insert(data_path="location", index=axis_index[move_axis], frame=end_frame)
+        
+        # Ensure the keyframe interpolation is set to linear for constant speed
+        fcurves = my_car.animation_data.action.fcurves
+        for fcurve in fcurves:
+            for kf in fcurve.keyframe_points:
+                kf.interpolation = 'LINEAR'
+    
+    elif drive_direction == 'turnleft': 
+        # Define the turn parameters
+        turn_start_frame = intersection_frame + stop_duration_frames + 28
+        turn_end_frame = turn_start_frame + 43
+        turn_angle = math.radians(90)  
+
+        # Define the initial position and speed
+        initial_position = my_car.location.copy()
+        speed = 0.9 # Adjust the speed as necessary
+
+        # Loop through the frames
+        for frame in range(start_frame, end_frame + 1):
+            bpy.context.scene.frame_set(frame)
+
+            if frame < intersection_frame:
+                # Move straight
+                if road in ['Road1', 'Road3']: 
+                    if road == 'Road1':
+                        my_car.location.y += speed
+                    else:
+                        my_car.location.y -= speed
+                
+                elif road in ['Road2', 'Road4']:
+                    if road == 'Road2':
+                        my_car.location.x += speed
+                    else:
+                        my_car.location.x -= speed
+
+            elif intersection_frame <= frame < (intersection_frame + stop_duration_frames):
+                # Pause at the intersection
+                pass
+
+            elif frame < turn_start_frame:
+                # Move straight after the pause
+                if road in ['Road1', 'Road3']: 
+                    if road == 'Road1':
+                        my_car.location.y += speed
+                    else:
+                        my_car.location.y -= speed
+                
+                elif road in ['Road2', 'Road4']:
+                    if road == 'Road2':
+                        my_car.location.x += speed
+                    else:
+                        my_car.location.x -= speed
+
+            elif frame <= turn_end_frame:
+                
+                t = (frame - turn_start_frame) / (turn_end_frame - turn_start_frame)
+                angle = t * turn_angle
+                my_car.rotation_euler.z = angle
+
+            else:
+                # Continue straight after the turn
+                if road in ['Road1']: 
+                    my_car.location.x -= speed
+                elif road in ['Road2']:
+                    my_car.location.y += speed
+                elif road in ['Road3']:
+                    my_car.location.x += speed
+                elif road in ['Road4']:
+                    my_car.location.y -= speed
+                
+            # Insert keyframes for location and rotation
+            my_car.keyframe_insert(data_path="location", frame=frame)
+            my_car.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+        bpy.context.scene.frame_set(start_frame)
+
+    elif drive_direction == 'turnright': #rightlane
+        # Define the turn parameters
+        turn_start_frame = intersection_frame + stop_duration_frames + 15
+        turn_end_frame = turn_start_frame + 35
+        turn_angle = math.radians(-90)  
+
+        # Define the initial position and speed
+        initial_position = my_car.location.copy()
+        speed = 0.9 # Adjust the speed as necessary
+
+        # Loop through the frames
+        for frame in range(start_frame, end_frame + 1):
+            bpy.context.scene.frame_set(frame)
+
+            if frame < intersection_frame:
+                # Move straight
+                if road in ['Road1', 'Road3']: 
+                    if road == 'Road1':
+                        my_car.location.y += speed
+                    else:
+                        my_car.location.y -= speed
+                
+                elif road in ['Road2', 'Road4']:
+                    if road == 'Road2':
+                        my_car.location.x += speed
+                    else:
+                        my_car.location.x -= speed
+
+            elif intersection_frame <= frame < (intersection_frame + stop_duration_frames):
+                # Pause at the intersection
+                pass
+
+            elif frame < turn_start_frame:
+                # Move straight after the pause
+                if road in ['Road1', 'Road3']: 
+                    if road == 'Road1':
+                        my_car.location.y += speed
+                    else:
+                        my_car.location.y -= speed
+                
+                elif road in ['Road2', 'Road4']:
+                    if road == 'Road2':
+                        my_car.location.x += speed
+                    else:
+                        my_car.location.x -= speed
+
+            elif frame <= turn_end_frame:
+                # Calculate the turning progress
+                t = (frame - turn_start_frame) / (turn_end_frame - turn_start_frame)
+                angle = t * turn_angle
+                my_car.rotation_euler.z = angle
+
+            else:
+                # Continue straight after the turn
+                if road in ['Road1']: 
+                    my_car.location.x += speed
+                elif road in ['Road2']:
+                    my_car.location.y -= speed
+                elif road in ['Road3']:
+                    my_car.location.x -= speed
+                elif road in ['Road4']:
+                    my_car.location.y += speed
+                
+            # Insert keyframes for location and rotation
+            my_car.keyframe_insert(data_path="location", frame=frame)
+            my_car.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+        bpy.context.scene.frame_set(start_frame)
+
+# Example usage:
+# movetheVehicle(x, y, z, "Road1", my_car, "straight", distance)
+# movetheVehicle(x, y, z, "Road1", my_car, "turnleft", distance)
+# movetheVehicle(x, y, z, "Road1", my_car, "turnright", distance)
+def lidar_scanners_handler(scene):
+    if scene.frame_current >= 100 and  scene.frame_current <= 200:
+        """Handles LiDAR scanning and CSV file generation."""
+        global Lidar_coll, lidar_names, object_classes, instance_counts, scan_instance_counts
+        lidars_to_scan = ["center_lidar"]
+        road_lidars = ["road1_lidar", "road2_lidar", "road3_lidar", "road4_lidar"]
+        output_folder = "/Users/tariqqutub/Downloads/testing scene/P ointClouds/anim1"
+        
+        lid_collection = bpy.data.collections.get(Lidar_coll)
+        if lid_collection and lid_collection.objects:
+            bpy.context.view_layer.active_layer_collection = bpy.context.view_layer.layer_collection.children[Lidar_coll]
+            # Select one random lidar from the road_lidars list
+            selected_road_lidar = random.choice(road_lidars)
+            lidars_to_scan.append(selected_road_lidar)
+            for lidar_name in lidars_to_scan:
+                # file_name = f"{lidar_name}_frame_{scene.frame_current}"
+                # csv_file_name = f"{file_name}.csv"
+                # csv_file_path = os.path.join(output_folder, csv_file_name)
+                # # print(csv_file_path)
+                scanner_object = lid_collection.objects.get(lidar_name)
+                
+                if scanner_object:
+                    print(f"start scanning with {scanner_object.name}...... ")
+                    user_interface.scan_static(
+                            bpy.context,
+                            scannerObject=scanner_object,
+                            resolutionX=750, fovX=150, resolutionY=750, fovY=150, resolutionPercentage=100,
+                            reflectivityLower=0.01, distanceLower=1, reflectivityUpper=1, distanceUpper=100,
+                            maxReflectionDepth=10,
+                            enableAnimation=False, frameStart=1, frameEnd=1, frameStep=1, frameRate=24,
+                            addNoise=False, noiseType='gaussian', mu=0.0, sigma=0.01, noiseAbsoluteOffset=0.0,
+                            noiseRelativeOffset=0.0,
+                            simulateRain=False, rainfallRate=0.0,
+                            addMesh=False,
+                            exportLAS=False, exportHDF=False, exportCSV=True, exportPLY=False,exportSingleFrames=True,
+                            exportRenderedImage=False, exportSegmentedImage=False, exportPascalVoc=False,
+                            exportDepthmap=False, depthMinDistance=0.0, depthMaxDistance=100.0,
+                            dataFilePath=output_folder, dataFileName=lidar_name,
+                            debugLines=False, debugOutput=False, outputProgress=False,
+                            measureTime=True,
+                            singleRay=False, destinationObject=None, targetObject=None
+                        )
+            
+                    print("scann and label finished....")
+
+def set_active_collection_and_object(collection_name, obj_name):
+    collection = bpy.data.collections.get(collection_name)
+    if collection:
+        bpy.context.view_layer.active_layer_collection = bpy.context.view_layer.layer_collection.children[collection_name]
+        obj = collection.objects.get(obj_name)
+        if obj:
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            print(f"'{obj}' selected")
+            return obj
+    return None
+def get_hemisphere_vertices(obj_name):
+    obj = bpy.data.objects.get(obj_name)
+    if not obj:
+        print(f"Object '{obj_name}' not found.")
+        return []
+    hemisphere_verts = [obj.matrix_world @ vertex.co for vertex in obj.data.vertices]
+
+    return hemisphere_verts
+def continuously_update_lidar(lidar_obj, new_position, target_position):
+    if lidar_obj:
+        lidar_obj.location = new_position
+        # Calculate the direction vector from the sensor to the target
+        direction_vector = (target_position - new_position).normalized()
+        
+        # Orient the LiDAR to face the target
+        # Assuming the LiDAR sensor's 'forward' direction is along its local negative Z-axis
+        lidar_obj.rotation_mode = 'QUATERNION'
+        lidar_obj.rotation_quaternion = direction_vector.to_track_quat('-Z', 'Y') # 'Z' is the forward axis, 'Y' is the up axis
+
+        current_frame = bpy.context.scene.frame_current
+        lidar_obj.keyframe_insert(data_path="location", frame=current_frame)
+        print("Moved LIDAR to:", lidar_obj.location)
+    else:
+        print("LIDAR Object not found or collection is incorrect!")
+    return
+ 
+def startProgram():
+    global sphere_center, sphere_radius
+    global vehicles_types, vec_sel_prob, vec_collection, road_list, road_directions, cars_to_track, vec_real_dimensions, road_lanes
+    global ped_types, ped_collection, ped_scale_ranges, walk_area_list, walk_area_weights, peds_to_track
+    global center_Lidar, Lidar_coll, lidar_obj, lidar_move_every, hemisphere_vertices, road_center_targetView, lidar_names
+    global object_classes,instance_counts, scan_instance_counts
+    
+    # delete_objects_in_collection()
+    road_list = ['Road1', 'Road2', 'Road3', 'Road4']
+    road_lanes = ['rightlane', 'leftlane', 'centerlane']
+    vehicles_types = ['Car(sedan)', 'Car(mini car)', 'Car(pickup)', 'Truck', 'Bus'] 
+
+ 
+
+      #:::::::::::::LIDAR location configuration::::::::::::::::::::::
+
+    sphere = bpy.data.objects.get("LidarSphere")
+    if sphere and sphere.type == 'MESH':
+        sphere_center = sphere.location
+        # Assuming the sphere is a UV sphere, the radius is half the diameter (max dimension)
+        sphere_radius = max(sphere.dimensions) / 2
+        print("Dimensions:", sphere.dimensions) # Additional debug info
+        print("Calculated Radius:", sphere_radius) # Confirm radius calculation
+
+    else:
+        print(" sphere not found or not a mesh")
+
+    #getting sphere data and run lidar change method
+    lidar_move_every = 100 # change lidar location every 100 frames
+    center_Lidar = "center_lidar"
+    Lidar_coll = "LiDAR scanners"
+    lidar_names = {
+        "center_lidar": 0,
+        "road1_lidar": 1,
+        "road2_lidar": 2,
+        "road3_lidar": 3,
+        "road4_lidar": 4
+        }
+    lidar_obj = set_active_collection_and_object(Lidar_coll, center_Lidar)
+    hemisphere_vertices = get_hemisphere_vertices("LidarSphere")
+    road_center_targetView = bpy.data.collections.get("3LaneRoads").objects.get("Plane").location
+    print("Number of vertices:", len(hemisphere_vertices))
+    print("Sample vertices:", hemisphere_vertices[:5]) # Print the first 5 vertices
+    
+    if lidar_obj.animation_data:
+        lidar_obj.animation_data_clear()
+    print("Cleared existing animation data for LiDAR.")
+
+    # Reset LiDAR to the initial or center position
+    new_pos = random.choice(hemisphere_vertices)
+    continuously_update_lidar(lidar_obj, new_pos, road_center_targetView)
+    print("Resetting LiDAR to center at the end of animation.")
+
+    vec_sel_prob = [0.5, 0.01, 0.15, 0.05, 0.1] 
+
+   
+    vec_real_dimensions = {
+        #(y, z, x)
+        'Road1': {
+            'Car(sedan)': (1.74, 1.415, 4.63),
+            'Car(mini car)': (1.82, 1.74, 4.69),
+            'Car(pickup)': (2.520, 1.99, 6.141),
+            'Truck': ( 2.72, 4.01, 9.2 ),
+            'Bus': (2.55, 3.81, 12)
+            },
+        #(x, z, y)
+        'Road2': {
+            'Car(sedan)': (4.63, 1.415, 1.74),
+            'Car(mini car)': (4.69, 1.74, 1.82),
+            'Car(pickup)': (6.141, 1.99, 2.520),
+            'Truck': (9.2, 4.01, 2.72),
+            'Bus': (12, 3.81, 2.55),
+            },
+        #(y, z, x)
+        'Road3': {
+            'Car(sedan)': (1.74, 1.415, 4.63),
+            'Car(mini car)': (1.82, 1.74, 4.69),
+            'Car(pickup)': (2.520, 1.99, 6.141),
+            'Truck': ( 2.72, 4.01, 9.2 ),
+            'Bus': (2.55, 3.81, 12)
+            },
+        #(x, z, y)
+        'Road4': {
+            'Car(sedan)': (4.63, 1.415, 1.74),
+            'Car(mini car)': (4.69, 1.74, 1.82),
+            'Car(pickup)': (6.141, 1.99, 2.520),
+            'Truck': (9.2, 4.01, 2.72),
+            'Bus': (12, 3.81, 2.55),
+            }
+    }
+        ##defining a list to keep track of objects appearence in the scene and delete them after finish their animation
+    cars_to_track = {
+        'Road1': [],
+        'Road2': [],
+        'Road3': [],
+        'Road4': []
+    }
+    
+    num_vehicles_to_load = 4
+    num_pedestrians_to_load = 5  # Set the number of pedestrians to load
+    selected_road_lanes = random.choices([(road, lane) for road in road_list for lane in road_lanes], k=num_vehicles_to_load)
+    
+    
+    for road, lane in selected_road_lanes:
+        
+#    road, lane = selected_road_lanes[0]
+        vehicle = random.choices(vehicles_types, weights=vec_sel_prob, k=1)[0] # Assuming vehicles_types is defined elsewhere
+
+        plane_name = road + '_' + lane + "_Plane"
+        
+        min_x, max_x, min_y, max_y, z_axis = obj_loading_region(plane_name)
+        x = random.uniform(min_x, max_x)
+        y = random.uniform(min_y, max_y)
+        z = z_axis
+        
+        print(plane_name)
+        
+        if lane in 'rightlane':
+        # choose turnright direction
+            drive_direction = 'turnright' # road_directions[1]
+        elif lane in 'leftlane':
+        # choose randomly between turn left or uturn
+            drive_direction = 'turnleft' #random.choice(['turnleft', 'uturn'])  [road_directions[0], road_directions[3]])
+        else:
+        # moving straight
+            drive_direction = 'straight' # road_directions[2]
+    #    proposed_location = Vector((x, y))
+        car_dimensions = vec_real_dimensions[road][vehicle]
+        print(car_dimensions)
+        generate_vehicle(x,y,z, "Vehicles", road, vehicle, car_dimensions, drive_direction)
+    
+       
+    end_time = time.time()
+    ped_types = ['Man1', 'Man2', 'Women1', 'Women2', 'Child'] # appears in normal distribution (equal probabilities)
+    walk_area_list = ['sidewalk_right', 'sidewalk_left', 'cornerwalk1', 'cornerwalk2', 'cornerwalk3', 'cornerwalk4']
+    walk_area_weights = [3, 3, 1, 1, 1, 1]
+    # Dictionary mapping pedestrian types to their scale ranges
+    ped_scale_ranges = {
+        "Man1": (0.0041, 0.0051),
+        "Man2": (0.0083, 0.0104),
+        "Women1": (0.0078, 0.0094),
+        "Women2": (0.0077, 0.0092),
+        "Child": (0.00511, 0.00712)
+    }
+
+    # Assign category and part IDs to all objects in all collections before importing moving objects
+    for collection in bpy.data.collections:   
+        for obj in collection.all_objects:
+            category_id = obj.parent.name if obj.parent else obj.name
+            part_id = category_id#obj.name
+            set_category_id(obj, category_id, part_id)
+   
+     #::::::::::::::Generating pedestrians::::::::::::::::::
+    ped_collection = "Pedestrians"
+    peds_to_track = []
+    
+    # # Randomly select pedestrian types and walk areas
+    selected_ped_walk_areas = random.choices([(ped, area) for ped in ped_types for area in walk_area_list], k=num_pedestrians_to_load)
+
+    for ped, walk_area in selected_ped_walk_areas:
+        # for ped in selected_peds:
+        if walk_area.startswith('cornerwalk'):
+            ped_anim = 'Standing'
+            ped_name = ped + '_' + ped_anim
+            area = walk_area
+            min_x, max_x, min_y, max_y, z_axis = ped_load_region(area)
+            pedestrian, ped_end_frame = import_pedestrian(ped_name, min_x, max_x, min_y, max_y, z_axis, ped_collection, area, None, ped_scale_ranges)
+            peds_to_track.append((pedestrian, ped_end_frame))
+        else:
+            ped_anim = random.choices(['Walking'], k=1)[0]
+            ped_name = ped + '_' + ped_anim
+            ped_road = random.choice(road_list)
+            area = ped_road + "_" + walk_area
+            # print(area)
+            min_x, max_x, min_y, max_y, z_axis = ped_load_region(area)
+            pedestrian, ped_end_frame = import_pedestrian(ped_name, min_x, max_x, min_y, max_y, z_axis, ped_collection, area, ped_road, ped_scale_ranges)
+            peds_to_track.append((pedestrian, ped_end_frame))
+        if pedestrian:
+            print("new pedestrian imported...............")
+
+    # bpy.app.handlers.frame_change_pre.clear()
+    # bpy.app.handlers.frame_change_pre.append(lidar_scanners_handler)
+        
+    
+ 
+    # Check for collision
+#    while check_collision(proposed_location, [car.location.xy for car, _ in cars_to_track[road]], (car_dimensions[0], car_dimensions[1])):
+#    # If collision, recalculate location
+#        x = random.uniform(min_x, max_x)
+#        y = random.uniform(min_y, max_y)
+#        proposed_location = Vector((x, y))
+
+# load vehicle at the final location
+    
+startProgram()
